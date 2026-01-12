@@ -30,7 +30,8 @@ import { StakeManagerABI } from '../web3/abi';
 
 // --- CONFIG ---
 const STAKE_MANAGER_ADDRESS = '0xb42550f0038827727142a9e52579f2e616b20894' as Address;
-const PAYMASTER_ADDRESS = '0x2ac838ebceb627f098c15904f090637ff07a76ed' as Address;
+// Official Lens Testnet Paymaster (from zks_getTestnetPaymaster RPC)
+const PAYMASTER_ADDRESS = '0x2a3221e4e06bb53906c910146653afb85bf448b2' as Address;
 const CHAIN_ID = 37111;
 
 // Lens Testnet - extends zkSync for proper formatters

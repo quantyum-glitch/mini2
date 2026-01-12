@@ -41,8 +41,8 @@ const lensTestnet = defineChain({
   testnet: true,
 });
 
-// General paymaster flow: selector 0x8c5a3445 + ABI-encoded empty bytes
-const PAYMASTER_INPUT = '0x8c5a344500000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000000' as `0x${string}`;
+// General paymaster flow: just the selector (no ABI encoding needed for testnet paymaster)
+const PAYMASTER_INPUT = '0x8c5a3445' as `0x${string}`;
 
 // --- HELPERS ---
 function randomBytes32(): `0x${string}` {

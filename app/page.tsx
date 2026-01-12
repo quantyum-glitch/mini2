@@ -15,7 +15,12 @@ import {
   concat,
   pad,
   hexToBigInt,
+  hexToBytes,
 } from 'viem';
+
+function addressToBigInt(addr: Address): bigint {
+  return hexToBigInt(addr);
+}
 import { zkSyncSepoliaTestnet } from 'viem/chains';
 import {
   serializeTransaction,
@@ -81,8 +86,21 @@ const zkSyncTxTypes = {
   ],
 } as const;
 
-function addressToBigInt(addr: Address): bigint {
-  return hexToBigInt(addr);
+// Helper to get exact ZKsync fee parameters
+async function getZkSyncFee(transaction: any) {
+  const response = await fetch('https://rpc.testnet.lens.dev', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'zks_estimateFee',
+      params: [transaction],
+    }),
+  });
+  const data = await response.json();
+  if (data.error) throw new Error(data.error.message);
+  return data.result;
 }
 
 // Manual EIP-712 signing + serialization for ZKsync
@@ -96,19 +114,44 @@ async function sendZkSyncPaymasterTransaction(
   paymasterInput: `0x${string}`,
   addLog: (msg: string) => void
 ): Promise<`0x${string}`> {
-  addLog('Step 1: Fetching nonce and gas prices...');
+  addLog('Step 1: Estimating Fees (zks_estimateFee)...');
 
-  const [nonce, gasPrice] = await Promise.all([
-    publicClient.getTransactionCount({ address: account }),
-    publicClient.getGasPrice(),
-  ]);
+  // Construct partial tx for estimation
+  const estimateTx = {
+    from: account,
+    to,
+    data,
+    type: '0x71',
+    eip712Meta: {
+      paymasterParams: {
+        paymaster,
+        paymasterInput: Array.from(hexToBytes(paymasterInput))
+      }
+    }
+  };
 
-  addLog(`Nonce: ${nonce}, Gas Price: ${gasPrice}`);
+  // Getting proper estimation from node
+  // Note: zks_estimateFee requires specific JSON format
+  const feeData = await getZkSyncFee({
+    from: account,
+    to,
+    data,
+    eip712Meta: {
+      paymasterParams: {
+        paymaster,
+        paymasterInput
+      }
+    }
+  });
 
-  const gasLimit = 3000000n;
-  const gasPerPubdataByteLimit = 50000n;
-  const maxFeePerGas = gasPrice;
-  const maxPriorityFeePerGas = 100000000n; // 0.1 gwei
+  addLog(`Estimated: Gas=${parseInt(feeData.gas_limit)}, Pubdata=${parseInt(feeData.gas_per_pubdata_limit)}`);
+
+  const nonce = await publicClient.getTransactionCount({ address: account });
+
+  const gasLimit = BigInt(feeData.gas_limit);
+  const gasPerPubdataByteLimit = BigInt(feeData.gas_per_pubdata_limit);
+  const maxFeePerGas = BigInt(feeData.max_fee_per_gas);
+  const maxPriorityFeePerGas = BigInt(feeData.max_priority_fee_per_gas);
 
   addLog('Step 2: Building EIP-712 message...');
 

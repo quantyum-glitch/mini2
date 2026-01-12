@@ -261,24 +261,18 @@ export default function Home() {
         transport: http(),
       });
 
-      // Generate test data
-      const targetId = randomBytes32();
-      const groveHash = randomBytes32();
-      const boardId = randomBytes32();
+      // Test with simple transfer (no contract call) to verify paymaster works
+      // Send 0 GRASS to self
+      const testRecipient = address; // send to self
+      const callData = '0x' as `0x${string}`; // empty data for simple transfer
 
-      addLog(`Target: ${targetId.slice(0, 18)}...`);
-
-      const callData = encodeFunctionData({
-        abi: StakeManagerABI,
-        functionName: 'stakePost',
-        args: [targetId, groveHash, boardId, 0n],
-      });
+      addLog(`Testing simple transfer to self...`);
 
       const txHash = await sendGaslessTransaction(
         walletClient,
         publicClient,
         address,
-        STAKE_MANAGER_ADDRESS,
+        testRecipient,
         callData,
         PAYMASTER_ADDRESS,
         PAYMASTER_INPUT,

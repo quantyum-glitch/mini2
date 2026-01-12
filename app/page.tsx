@@ -105,7 +105,7 @@ async function sendZkSyncPaymasterTransaction(
 
   addLog(`Nonce: ${nonce}, Gas Price: ${gasPrice}`);
 
-  const gasLimit = 500000n;
+  const gasLimit = 3000000n;
   const gasPerPubdataByteLimit = 50000n;
   const maxFeePerGas = gasPrice;
   const maxPriorityFeePerGas = 100000000n; // 0.1 gwei

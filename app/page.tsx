@@ -2,21 +2,36 @@
 'use client';
 
 import { useState } from 'react';
-import { createWalletClient, custom, Address, defineChain, getAddress, encodeFunctionData } from 'viem';
+import {
+  createWalletClient,
+  createPublicClient,
+  custom,
+  http,
+  Address,
+  defineChain,
+  getAddress,
+  encodeFunctionData,
+  toHex,
+  concat,
+  pad,
+  hexToBigInt,
+} from 'viem';
 import { zkSyncSepoliaTestnet } from 'viem/chains';
-import { eip712WalletActions } from 'viem/zksync';
+import {
+  serializeTransaction,
+  type ZkSyncTransactionSerializableEIP712,
+} from 'viem/zksync';
 import { StakeManagerABI } from '../web3/abi';
 
 // --- CONFIG ---
-// Hardcoded lowercase to ensure initial validity, but we will sanitize with getAddress() anyway.
 const STAKE_MANAGER_ADDRESS = '0xb42550f0038827727142a9e52579f2e616b20894' as Address;
 const PAYMASTER_ADDRESS = '0x2ac838ebceb627f098c15904f090637ff07a76ed' as Address;
 const CHAIN_ID = 37111;
 
-// Define custom chain using ZKsync base to ensure formatters are present
+// Lens Testnet - extends zkSync for proper formatters
 const lensTestnet = defineChain({
   ...zkSyncSepoliaTestnet,
-  id: 37111,
+  id: CHAIN_ID,
   name: 'Lens Testnet',
   nativeCurrency: { name: 'GRASS', symbol: 'GRASS', decimals: 18 },
   rpcUrls: {
@@ -28,178 +43,306 @@ const lensTestnet = defineChain({
   testnet: true,
 });
 
-// --- HELPERS ---
-// General paymaster selector (0x8c5a3445) + empty inner input
-const GENERAL_PAYMASTER_INPUT = '0x8c5a344500000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000000' as `0x${string}`;
+// General paymaster flow selector + empty inner input
+const PAYMASTER_INPUT = '0x8c5a344500000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000000' as `0x${string}`;
 
-function randomHex(length: number): `0x${string}` {
-  if (typeof window === 'undefined') return ('0x' + '0'.repeat(length * 2)) as `0x${string}`;
-  const bytes = new Uint8Array(length);
+// --- HELPERS ---
+function randomBytes32(): `0x${string}` {
+  if (typeof window === 'undefined') return `0x${'0'.repeat(64)}` as `0x${string}`;
+  const bytes = new Uint8Array(32);
   crypto.getRandomValues(bytes);
-  return ('0x' + Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('')) as `0x${string}`;
+  return `0x${Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('')}` as `0x${string}`;
 }
 
-// Use viem's native eip712WalletActions for proper ZKsync transaction handling
-async function sendGaslessTransaction(
-  walletClient: ReturnType<typeof createWalletClient>,
+// ZKsync EIP-712 domain and types for transaction signing
+const getEip712Domain = (chainId: number) => ({
+  name: 'zkSync',
+  version: '2',
+  chainId,
+});
+
+const EIP712_TX_TYPE = 0x71; // 113 decimal
+
+const zkSyncTxTypes = {
+  Transaction: [
+    { name: 'txType', type: 'uint256' },
+    { name: 'from', type: 'uint256' },
+    { name: 'to', type: 'uint256' },
+    { name: 'gasLimit', type: 'uint256' },
+    { name: 'gasPerPubdataByteLimit', type: 'uint256' },
+    { name: 'maxFeePerGas', type: 'uint256' },
+    { name: 'maxPriorityFeePerGas', type: 'uint256' },
+    { name: 'paymaster', type: 'uint256' },
+    { name: 'nonce', type: 'uint256' },
+    { name: 'value', type: 'uint256' },
+    { name: 'data', type: 'bytes' },
+    { name: 'factoryDeps', type: 'bytes32[]' },
+    { name: 'paymasterInput', type: 'bytes' },
+  ],
+} as const;
+
+function addressToBigInt(addr: Address): bigint {
+  return hexToBigInt(addr);
+}
+
+// Manual EIP-712 signing + serialization for ZKsync
+async function sendZkSyncPaymasterTransaction(
+  walletClient: any,
+  publicClient: any,
   account: Address,
   to: Address,
   data: `0x${string}`,
-  paymasterAddress: Address,
+  paymaster: Address,
   paymasterInput: `0x${string}`,
   addLog: (msg: string) => void
 ): Promise<`0x${string}`> {
-  addLog('DEBUG: Using eip712WalletActions for native ZKsync tx...');
+  addLog('Step 1: Fetching nonce and gas prices...');
 
-  try {
-    const safeAccount = getAddress(account);
-    const safeTo = getAddress(to);
-    const safePaymaster = getAddress(paymasterAddress);
+  const [nonce, gasPrice] = await Promise.all([
+    publicClient.getTransactionCount({ address: account }),
+    publicClient.getGasPrice(),
+  ]);
 
-    addLog(`DEBUG: account=${safeAccount.slice(0,10)}..., to=${safeTo.slice(0,10)}...`);
-    addLog(`DEBUG: paymaster=${safePaymaster.slice(0,10)}...`);
+  addLog(`Nonce: ${nonce}, Gas Price: ${gasPrice}`);
 
-    // Extend wallet client with EIP-712 actions
-    const zkWalletClient = walletClient.extend(eip712WalletActions());
+  const gasLimit = 500000n;
+  const gasPerPubdataByteLimit = 50000n;
+  const maxFeePerGas = gasPrice;
+  const maxPriorityFeePerGas = 100000000n; // 0.1 gwei
 
-    addLog('DEBUG: Sending transaction via zkWalletClient.sendTransaction...');
+  addLog('Step 2: Building EIP-712 message...');
 
-    // Use the native sendTransaction which handles EIP-712 signing + serialization + sending
-    const hash = await zkWalletClient.sendTransaction({
-      account: safeAccount,
-      to: safeTo,
-      data,
-      paymaster: safePaymaster,
-      paymasterInput,
-      type: 'eip712',
-    });
+  // Build the typed data message
+  const message = {
+    txType: BigInt(EIP712_TX_TYPE),
+    from: addressToBigInt(account),
+    to: addressToBigInt(to),
+    gasLimit,
+    gasPerPubdataByteLimit,
+    maxFeePerGas,
+    maxPriorityFeePerGas,
+    paymaster: addressToBigInt(paymaster),
+    nonce: BigInt(nonce),
+    value: 0n,
+    data,
+    factoryDeps: [],
+    paymasterInput,
+  };
 
-    addLog(`DEBUG: Transaction hash received: ${hash}`);
-    return hash;
+  addLog('Step 3: Requesting EIP-712 signature from wallet...');
 
-  } catch (err: any) {
-    addLog(`CRITICAL ERROR: ${err.message}`);
-    console.error('Full error:', err);
-    if (err.cause) console.error('Cause:', err.cause);
-    throw err;
+  // Sign EIP-712 typed data
+  const signature = await walletClient.signTypedData({
+    account,
+    domain: getEip712Domain(CHAIN_ID),
+    types: zkSyncTxTypes,
+    primaryType: 'Transaction',
+    message,
+  });
+
+  addLog(`Signature received: ${signature.slice(0, 20)}...`);
+
+  addLog('Step 4: Serializing ZKsync transaction...');
+
+  // Build the transaction object for serialization
+  const txRequest: ZkSyncTransactionSerializableEIP712 = {
+    type: 'eip712',
+    chainId: CHAIN_ID,
+    from: account,
+    to,
+    nonce,
+    gas: gasLimit,
+    gasPerPubdata: gasPerPubdataByteLimit,
+    maxFeePerGas,
+    maxPriorityFeePerGas,
+    paymaster,
+    paymasterInput,
+    data,
+    value: 0n,
+    factoryDeps: [],
+    customSignature: signature,
+  };
+
+  // Serialize the transaction using viem's ZKsync serializer
+  const serializedTx = serializeTransaction(txRequest);
+  addLog(`Serialized TX: ${serializedTx.slice(0, 30)}... (${serializedTx.length} chars)`);
+
+  addLog('Step 5: Sending raw transaction to RPC...');
+
+  // Send via JSON-RPC
+  const response = await fetch('https://rpc.testnet.lens.dev', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      jsonrpc: '2.0',
+      id: Date.now(),
+      method: 'eth_sendRawTransaction',
+      params: [serializedTx],
+    }),
+  });
+
+  const result = await response.json();
+  addLog(`RPC Response: ${JSON.stringify(result)}`);
+
+  if (result.error) {
+    throw new Error(`RPC Error: ${result.error.message || JSON.stringify(result.error)}`);
   }
+
+  return result.result as `0x${string}`;
 }
 
 export default function Home() {
   const [address, setAddress] = useState<Address | null>(null);
   const [logs, setLogs] = useState<string[]>([]);
 
-  const addLog = (msg: string) => setLogs(prev => [...prev, `> ${msg}`]);
+  const addLog = (msg: string) => {
+    console.log(msg);
+    setLogs(prev => [...prev, `> ${msg}`]);
+  };
+
+  const clearLogs = () => setLogs([]);
 
   const ensureNetwork = async () => {
-    // @ts-ignore
     const chainIdHex = await window.ethereum.request({ method: 'eth_chainId' });
     const currentChainId = parseInt(chainIdHex, 16);
     addLog(`Current Chain ID: ${currentChainId}`);
 
     if (currentChainId !== CHAIN_ID) {
-      addLog(`Switching to Chain ${CHAIN_ID}...`);
+      addLog(`Switching to Lens Testnet (${CHAIN_ID})...`);
       try {
-        // @ts-ignore
         await window.ethereum.request({
           method: 'wallet_switchEthereumChain',
-          params: [{ chainId: '0x' + CHAIN_ID.toString(16) }],
+          params: [{ chainId: `0x${CHAIN_ID.toString(16)}` }],
         });
-      } catch (switchError: any) {
-        if (switchError.code === 4902) {
-          addLog("Chain not found, adding...");
-          // @ts-ignore
+      } catch (err: any) {
+        if (err.code === 4902) {
+          addLog('Adding Lens Testnet...');
           await window.ethereum.request({
             method: 'wallet_addEthereumChain',
-            params: [
-              {
-                chainId: '0x' + CHAIN_ID.toString(16),
-                chainName: 'Lens Testnet',
-                rpcUrls: ['https://rpc.testnet.lens.dev'],
-                blockExplorerUrls: ['https://block-explorer.testnet.lens.dev'],
-                nativeCurrency: { name: 'GRASS', symbol: 'GRASS', decimals: 18 }
-              },
-            ],
+            params: [{
+              chainId: `0x${CHAIN_ID.toString(16)}`,
+              chainName: 'Lens Testnet',
+              rpcUrls: ['https://rpc.testnet.lens.dev'],
+              blockExplorerUrls: ['https://block-explorer.testnet.lens.dev'],
+              nativeCurrency: { name: 'GRASS', symbol: 'GRASS', decimals: 18 },
+            }],
           });
         } else {
-          throw switchError;
+          throw err;
         }
       }
+      addLog('Network switched successfully');
     }
   };
 
   const connect = async () => {
-    // @ts-ignore
-    if (!window.ethereum) return alert('No Wallet');
-    // @ts-ignore
+    if (!window.ethereum) {
+      alert('Please install MetaMask or another Web3 wallet');
+      return;
+    }
     const [addr] = await window.ethereum.request({ method: 'eth_requestAccounts' });
     setAddress(addr);
     addLog(`Connected: ${addr}`);
     await ensureNetwork();
   };
 
-  const post = async () => {
-    try {
-      if (!address) return;
-      await ensureNetwork();
+  const postGasless = async () => {
+    if (!address) return;
+    clearLogs();
 
-      addLog('Starting Gasless Post...');
+    try {
+      await ensureNetwork();
+      addLog('=== Starting Gasless Post ===');
 
       const walletClient = createWalletClient({
         account: address,
         chain: lensTestnet,
-        // @ts-ignore
-        transport: custom(window.ethereum)
+        transport: custom(window.ethereum),
       });
 
-      // Dummy Data for stakePost
-      const targetId = randomHex(32);
-      const groveHash = randomHex(32);
-      const boardId = randomHex(32);
+      const publicClient = createPublicClient({
+        chain: lensTestnet,
+        transport: http(),
+      });
 
-      addLog(`targetId: ${targetId.slice(0, 18)}...`);
-      addLog(`groveHash: ${groveHash.slice(0, 18)}...`);
+      // Generate random data for stakePost
+      const targetId = randomBytes32();
+      const groveHash = randomBytes32();
+      const boardId = randomBytes32();
 
-      const data = encodeFunctionData({
+      addLog(`Target ID: ${targetId.slice(0, 18)}...`);
+
+      const callData = encodeFunctionData({
         abi: StakeManagerABI,
         functionName: 'stakePost',
         args: [targetId, groveHash, boardId, 0n],
       });
 
-      addLog('Requesting EIP-712 Signature via Wallet...');
+      addLog(`Call data: ${callData.slice(0, 30)}...`);
 
-      const hash = await sendGaslessTransaction(
+      const txHash = await sendZkSyncPaymasterTransaction(
         walletClient,
+        publicClient,
         address,
         STAKE_MANAGER_ADDRESS,
-        data,
+        callData,
         PAYMASTER_ADDRESS,
-        GENERAL_PAYMASTER_INPUT,
+        PAYMASTER_INPUT,
         addLog
       );
 
-      addLog(`Success! TX: ${hash}`);
-      addLog(`Explorer: https://block-explorer.testnet.lens.dev/tx/${hash}`);
-    } catch (e: any) {
-      addLog(`Error: ${e.message}`);
-      if (e.cause) console.error(e.cause);
-      console.error(e);
+      addLog(`=== SUCCESS ===`);
+      addLog(`TX Hash: ${txHash}`);
+      addLog(`Explorer: https://block-explorer.testnet.lens.dev/tx/${txHash}`);
+
+    } catch (err: any) {
+      addLog(`ERROR: ${err.message}`);
+      console.error('Full error:', err);
     }
   };
 
   return (
-    <main className="p-10 font-mono">
-      <h1 className="text-xl font-bold mb-4">Mini2 Gasless Demo</h1>
+    <main className="p-8 font-mono max-w-4xl mx-auto">
+      <h1 className="text-2xl font-bold mb-6">Mini2 Gasless Demo</h1>
+      <p className="text-sm text-gray-500 mb-4">Lens Testnet | Chain ID: {CHAIN_ID}</p>
+
       {!address ? (
-        <button onClick={connect} className="bg-blue-500 text-white p-2">Connect Wallet</button>
+        <button
+          onClick={connect}
+          className="bg-blue-600 hover:bg-blue-700 text-white px-6 py-3 rounded-lg font-semibold"
+        >
+          Connect Wallet
+        </button>
       ) : (
         <div className="space-y-4">
-          <p>Wallet: {address}</p>
-          <button onClick={post} className="bg-green-500 text-white p-2">POST GASLESS (Fresh Wallet)</button>
+          <p className="text-sm">
+            <span className="text-gray-500">Wallet:</span>{' '}
+            <span className="font-medium">{address}</span>
+          </p>
+          <div className="flex gap-4">
+            <button
+              onClick={postGasless}
+              className="bg-green-600 hover:bg-green-700 text-white px-6 py-3 rounded-lg font-semibold"
+            >
+              POST GASLESS
+            </button>
+            <button
+              onClick={clearLogs}
+              className="bg-gray-600 hover:bg-gray-700 text-white px-4 py-3 rounded-lg"
+            >
+              Clear Logs
+            </button>
+          </div>
         </div>
       )}
-      <div className="mt-8 bg-gray-900 text-green-400 p-4 min-h-[200px]">
-        {logs.map((l, i) => <div key={i}>{l}</div>)}
+
+      <div className="mt-8 bg-gray-900 text-green-400 p-4 rounded-lg min-h-[300px] overflow-auto text-sm">
+        <div className="text-gray-500 mb-2">// Transaction Log</div>
+        {logs.length === 0 ? (
+          <div className="text-gray-600">Waiting for action...</div>
+        ) : (
+          logs.map((log, i) => <div key={i} className="py-0.5">{log}</div>)
+        )}
       </div>
     </main>
   );

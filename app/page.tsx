@@ -9,19 +9,15 @@ import {
   http,
   Address,
   defineChain,
-  getAddress,
-  encodeFunctionData,
-  hexToBigInt,
+  parseEther,
 } from 'viem';
 import { zkSyncSepoliaTestnet } from 'viem/chains';
 import {
-  serializeTransaction,
-  type ZkSyncTransactionSerializableEIP712,
+  eip712WalletActions,
+  getGeneralPaymasterInput,
 } from 'viem/zksync';
-import { StakeManagerABI } from '../web3/abi';
 
 // --- CONFIG ---
-const STAKE_MANAGER_ADDRESS = '0xb42550f0038827727142a9e52579f2e616b20894' as Address;
 // Official Lens Testnet Paymaster (from zks_getTestnetPaymaster RPC)
 const PAYMASTER_ADDRESS = '0x2a3221e4e06bb53906c910146653afb85bf448b2' as Address;
 const CHAIN_ID = 37111;
@@ -40,154 +36,6 @@ const lensTestnet = defineChain({
   },
   testnet: true,
 });
-
-// Approval-based paymaster flow selector (0x949431dc)
-// Format: selector + token + minAllowance + innerInput
-// Using zero address for token (native), 0 allowance, empty inner
-const PAYMASTER_INPUT = '0x949431dc0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000600000000000000000000000000000000000000000000000000000000000000000' as `0x${string}`;
-
-// --- HELPERS ---
-function randomBytes32(): `0x${string}` {
-  if (typeof window === 'undefined') return `0x${'0'.repeat(64)}` as `0x${string}`;
-  const bytes = new Uint8Array(32);
-  crypto.getRandomValues(bytes);
-  return `0x${Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('')}` as `0x${string}`;
-}
-
-// ZKsync EIP-712 domain
-const getEip712Domain = (chainId: number) => ({
-  name: 'zkSync',
-  version: '2',
-  chainId,
-});
-
-const EIP712_TX_TYPE = 0x71; // 113 decimal
-
-// ZKsync EIP-712 transaction types
-const zkSyncTxTypes = {
-  Transaction: [
-    { name: 'txType', type: 'uint256' },
-    { name: 'from', type: 'uint256' },
-    { name: 'to', type: 'uint256' },
-    { name: 'gasLimit', type: 'uint256' },
-    { name: 'gasPerPubdataByteLimit', type: 'uint256' },
-    { name: 'maxFeePerGas', type: 'uint256' },
-    { name: 'maxPriorityFeePerGas', type: 'uint256' },
-    { name: 'paymaster', type: 'uint256' },
-    { name: 'nonce', type: 'uint256' },
-    { name: 'value', type: 'uint256' },
-    { name: 'data', type: 'bytes' },
-    { name: 'factoryDeps', type: 'bytes32[]' },
-    { name: 'paymasterInput', type: 'bytes' },
-  ],
-} as const;
-
-function addressToBigInt(addr: Address): bigint {
-  return hexToBigInt(addr);
-}
-
-// Send gasless ZKsync transaction with paymaster
-async function sendGaslessTransaction(
-  walletClient: any,
-  publicClient: any,
-  account: Address,
-  to: Address,
-  data: `0x${string}`,
-  paymaster: Address,
-  paymasterInput: `0x${string}`,
-  addLog: (msg: string) => void
-): Promise<`0x${string}`> {
-
-  addLog('Step 1: Getting nonce and gas price...');
-
-  const [nonce, gasPrice] = await Promise.all([
-    publicClient.getTransactionCount({ address: account }),
-    publicClient.getGasPrice(),
-  ]);
-
-  addLog(`Nonce: ${nonce}, Gas Price: ${gasPrice}`);
-
-  // Use reasonable defaults for ZKsync
-  const gasLimit = 500000n;
-  const gasPerPubdataByteLimit = 800n;
-  const maxFeePerGas = gasPrice;
-  const maxPriorityFeePerGas = gasPrice > 100000000n ? 100000000n : gasPrice;
-
-  addLog('Step 2: Building EIP-712 message...');
-
-  const message = {
-    txType: BigInt(EIP712_TX_TYPE),
-    from: addressToBigInt(account),
-    to: addressToBigInt(to),
-    gasLimit,
-    gasPerPubdataByteLimit,
-    maxFeePerGas,
-    maxPriorityFeePerGas,
-    paymaster: addressToBigInt(paymaster),
-    nonce: BigInt(nonce),
-    value: 0n,
-    data,
-    factoryDeps: [],
-    paymasterInput,
-  };
-
-  addLog('Step 3: Requesting EIP-712 signature...');
-
-  const signature = await walletClient.signTypedData({
-    account,
-    domain: getEip712Domain(CHAIN_ID),
-    types: zkSyncTxTypes,
-    primaryType: 'Transaction',
-    message,
-  });
-
-  addLog(`Signature: ${signature.slice(0, 20)}...`);
-
-  addLog('Step 4: Serializing transaction...');
-
-  const txRequest: ZkSyncTransactionSerializableEIP712 = {
-    type: 'eip712',
-    chainId: CHAIN_ID,
-    from: account,
-    to,
-    nonce,
-    gas: gasLimit,
-    gasPerPubdata: gasPerPubdataByteLimit,
-    maxFeePerGas,
-    maxPriorityFeePerGas,
-    paymaster,
-    paymasterInput,
-    data,
-    value: 0n,
-    factoryDeps: [],
-    customSignature: signature,
-  };
-
-  const serializedTx = serializeTransaction(txRequest);
-  addLog(`Serialized: ${serializedTx.length} chars`);
-
-  addLog('Step 5: Sending transaction...');
-
-  const response = await fetch('https://rpc.testnet.lens.dev', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      jsonrpc: '2.0',
-      id: Date.now(),
-      method: 'eth_sendRawTransaction',
-      params: [serializedTx],
-    }),
-  });
-
-  const result = await response.json();
-
-  if (result.error) {
-    addLog(`RPC Error: ${JSON.stringify(result.error)}`);
-    throw new Error(result.error.message || JSON.stringify(result.error));
-  }
-
-  return result.result as `0x${string}`;
-}
 
 export default function Home() {
   const [address, setAddress] = useState<Address | null>(null);
@@ -248,7 +96,50 @@ export default function Home() {
 
     try {
       await ensureNetwork();
-      addLog('=== Starting Gasless Transaction ===');
+      addLog('=== Testing Gasless Transaction ===');
+
+      // Create wallet client with EIP-712 actions
+      const walletClient = createWalletClient({
+        account: address,
+        chain: lensTestnet,
+        transport: custom(window.ethereum),
+      }).extend(eip712WalletActions());
+
+      addLog('Wallet client created with eip712WalletActions');
+
+      // Generate paymaster input using viem's utility
+      const paymasterInput = getGeneralPaymasterInput({ innerInput: '0x' });
+      addLog(`Paymaster input: ${paymasterInput.slice(0, 20)}...`);
+
+      addLog('Sending transaction via walletClient.sendTransaction...');
+
+      // Use viem's native sendTransaction with paymaster
+      const hash = await walletClient.sendTransaction({
+        to: address, // send to self
+        value: 0n,
+        paymaster: PAYMASTER_ADDRESS,
+        paymasterInput,
+      });
+
+      addLog(`=== SUCCESS ===`);
+      addLog(`TX: ${hash}`);
+      addLog(`https://block-explorer.testnet.lens.dev/tx/${hash}`);
+
+    } catch (err: any) {
+      addLog(`ERROR: ${err.message}`);
+      if (err.shortMessage) addLog(`Short: ${err.shortMessage}`);
+      console.error('Full error:', err);
+    }
+  };
+
+  // Test without paymaster (self-funded)
+  const postSelfFunded = async () => {
+    if (!address) return;
+    clearLogs();
+
+    try {
+      await ensureNetwork();
+      addLog('=== Testing Self-Funded Transaction ===');
 
       const walletClient = createWalletClient({
         account: address,
@@ -256,32 +147,16 @@ export default function Home() {
         transport: custom(window.ethereum),
       });
 
-      const publicClient = createPublicClient({
-        chain: lensTestnet,
-        transport: http(),
+      addLog('Sending regular transaction (no paymaster)...');
+
+      const hash = await walletClient.sendTransaction({
+        to: address,
+        value: 0n,
       });
 
-      // Test with simple transfer (no contract call) to verify paymaster works
-      // Send 0 GRASS to self
-      const testRecipient = address; // send to self
-      const callData = '0x' as `0x${string}`; // empty data for simple transfer
-
-      addLog(`Testing simple transfer to self...`);
-
-      const txHash = await sendGaslessTransaction(
-        walletClient,
-        publicClient,
-        address,
-        testRecipient,
-        callData,
-        PAYMASTER_ADDRESS,
-        PAYMASTER_INPUT,
-        addLog
-      );
-
       addLog(`=== SUCCESS ===`);
-      addLog(`TX: ${txHash}`);
-      addLog(`https://block-explorer.testnet.lens.dev/tx/${txHash}`);
+      addLog(`TX: ${hash}`);
+      addLog(`https://block-explorer.testnet.lens.dev/tx/${hash}`);
 
     } catch (err: any) {
       addLog(`ERROR: ${err.message}`);
@@ -307,12 +182,18 @@ export default function Home() {
             <span className="text-gray-500">Wallet:</span>{' '}
             <span className="font-medium">{address}</span>
           </p>
-          <div className="flex gap-4">
+          <div className="flex gap-4 flex-wrap">
             <button
               onClick={postGasless}
               className="bg-green-600 hover:bg-green-700 text-white px-6 py-3 rounded-lg font-semibold"
             >
-              POST GASLESS
+              GASLESS (Paymaster)
+            </button>
+            <button
+              onClick={postSelfFunded}
+              className="bg-yellow-600 hover:bg-yellow-700 text-white px-6 py-3 rounded-lg font-semibold"
+            >
+              SELF-FUNDED (No Paymaster)
             </button>
             <button
               onClick={clearLogs}

@@ -41,8 +41,10 @@ const lensTestnet = defineChain({
   testnet: true,
 });
 
-// General paymaster flow: just the selector (no ABI encoding needed for testnet paymaster)
-const PAYMASTER_INPUT = '0x8c5a3445' as `0x${string}`;
+// Approval-based paymaster flow selector (0x949431dc)
+// Format: selector + token + minAllowance + innerInput
+// Using zero address for token (native), 0 allowance, empty inner
+const PAYMASTER_INPUT = '0x949431dc0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000600000000000000000000000000000000000000000000000000000000000000000' as `0x${string}`;
 
 // --- HELPERS ---
 function randomBytes32(): `0x${string}` {

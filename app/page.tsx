@@ -11,16 +11,8 @@ import {
   defineChain,
   getAddress,
   encodeFunctionData,
-  toHex,
-  concat,
-  pad,
   hexToBigInt,
-  hexToBytes,
 } from 'viem';
-
-function addressToBigInt(addr: Address): bigint {
-  return hexToBigInt(addr);
-}
 import { zkSyncSepoliaTestnet } from 'viem/chains';
 import {
   serializeTransaction,
@@ -34,7 +26,7 @@ const STAKE_MANAGER_ADDRESS = '0xb42550f0038827727142a9e52579f2e616b20894' as Ad
 const PAYMASTER_ADDRESS = '0x2a3221e4e06bb53906c910146653afb85bf448b2' as Address;
 const CHAIN_ID = 37111;
 
-// Lens Testnet - extends zkSync for proper formatters
+// Lens Testnet chain definition
 const lensTestnet = defineChain({
   ...zkSyncSepoliaTestnet,
   id: CHAIN_ID,
@@ -49,7 +41,7 @@ const lensTestnet = defineChain({
   testnet: true,
 });
 
-// General paymaster flow selector + empty inner input
+// General paymaster flow: selector 0x8c5a3445 + ABI-encoded empty bytes
 const PAYMASTER_INPUT = '0x8c5a344500000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000000' as `0x${string}`;
 
 // --- HELPERS ---
@@ -60,7 +52,7 @@ function randomBytes32(): `0x${string}` {
   return `0x${Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('')}` as `0x${string}`;
 }
 
-// ZKsync EIP-712 domain and types for transaction signing
+// ZKsync EIP-712 domain
 const getEip712Domain = (chainId: number) => ({
   name: 'zkSync',
   version: '2',
@@ -69,6 +61,7 @@ const getEip712Domain = (chainId: number) => ({
 
 const EIP712_TX_TYPE = 0x71; // 113 decimal
 
+// ZKsync EIP-712 transaction types
 const zkSyncTxTypes = {
   Transaction: [
     { name: 'txType', type: 'uint256' },
@@ -87,25 +80,12 @@ const zkSyncTxTypes = {
   ],
 } as const;
 
-// Helper to get exact ZKsync fee parameters
-async function getZkSyncFee(transaction: any) {
-  const response = await fetch('https://rpc.testnet.lens.dev', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      jsonrpc: '2.0',
-      id: 1,
-      method: 'zks_estimateFee',
-      params: [transaction],
-    }),
-  });
-  const data = await response.json();
-  if (data.error) throw new Error(data.error.message);
-  return data.result;
+function addressToBigInt(addr: Address): bigint {
+  return hexToBigInt(addr);
 }
 
-// Manual EIP-712 signing + serialization for ZKsync
-async function sendZkSyncPaymasterTransaction(
+// Send gasless ZKsync transaction with paymaster
+async function sendGaslessTransaction(
   walletClient: any,
   publicClient: any,
   account: Address,
@@ -115,48 +95,24 @@ async function sendZkSyncPaymasterTransaction(
   paymasterInput: `0x${string}`,
   addLog: (msg: string) => void
 ): Promise<`0x${string}`> {
-  addLog('Step 1: Estimating Fees (zks_estimateFee)...');
 
-  // Construct partial tx for estimation
-  const estimateTx = {
-    from: account,
-    to,
-    data,
-    type: '0x71',
-    eip712Meta: {
-      paymasterParams: {
-        paymaster,
-        paymasterInput: Array.from(hexToBytes(paymasterInput))
-      }
-    }
-  };
+  addLog('Step 1: Getting nonce and gas price...');
 
-  // Getting proper estimation from node
-  // Note: zks_estimateFee requires specific JSON format
-  const feeData = await getZkSyncFee({
-    from: account,
-    to,
-    data,
-    eip712Meta: {
-      paymasterParams: {
-        paymaster,
-        paymasterInput
-      }
-    }
-  });
+  const [nonce, gasPrice] = await Promise.all([
+    publicClient.getTransactionCount({ address: account }),
+    publicClient.getGasPrice(),
+  ]);
 
-  addLog(`Estimated: Gas=${parseInt(feeData.gas_limit)}, Pubdata=${parseInt(feeData.gas_per_pubdata_limit)}`);
+  addLog(`Nonce: ${nonce}, Gas Price: ${gasPrice}`);
 
-  const nonce = await publicClient.getTransactionCount({ address: account });
-
-  const gasLimit = BigInt(feeData.gas_limit);
-  const gasPerPubdataByteLimit = BigInt(feeData.gas_per_pubdata_limit);
-  const maxFeePerGas = BigInt(feeData.max_fee_per_gas);
-  const maxPriorityFeePerGas = BigInt(feeData.max_priority_fee_per_gas);
+  // Use reasonable defaults for ZKsync
+  const gasLimit = 500000n;
+  const gasPerPubdataByteLimit = 800n;
+  const maxFeePerGas = gasPrice;
+  const maxPriorityFeePerGas = gasPrice > 100000000n ? 100000000n : gasPrice;
 
   addLog('Step 2: Building EIP-712 message...');
 
-  // Build the typed data message
   const message = {
     txType: BigInt(EIP712_TX_TYPE),
     from: addressToBigInt(account),
@@ -173,9 +129,8 @@ async function sendZkSyncPaymasterTransaction(
     paymasterInput,
   };
 
-  addLog('Step 3: Requesting EIP-712 signature from wallet...');
+  addLog('Step 3: Requesting EIP-712 signature...');
 
-  // Sign EIP-712 typed data
   const signature = await walletClient.signTypedData({
     account,
     domain: getEip712Domain(CHAIN_ID),
@@ -184,11 +139,10 @@ async function sendZkSyncPaymasterTransaction(
     message,
   });
 
-  addLog(`Signature received: ${signature.slice(0, 20)}...`);
+  addLog(`Signature: ${signature.slice(0, 20)}...`);
 
-  addLog('Step 4: Serializing ZKsync transaction...');
+  addLog('Step 4: Serializing transaction...');
 
-  // Build the transaction object for serialization
   const txRequest: ZkSyncTransactionSerializableEIP712 = {
     type: 'eip712',
     chainId: CHAIN_ID,
@@ -207,13 +161,11 @@ async function sendZkSyncPaymasterTransaction(
     customSignature: signature,
   };
 
-  // Serialize the transaction using viem's ZKsync serializer
   const serializedTx = serializeTransaction(txRequest);
-  addLog(`Serialized TX: ${serializedTx.slice(0, 30)}... (${serializedTx.length} chars)`);
+  addLog(`Serialized: ${serializedTx.length} chars`);
 
-  addLog('Step 5: Sending raw transaction to RPC...');
+  addLog('Step 5: Sending transaction...');
 
-  // Send via JSON-RPC
   const response = await fetch('https://rpc.testnet.lens.dev', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -226,10 +178,10 @@ async function sendZkSyncPaymasterTransaction(
   });
 
   const result = await response.json();
-  addLog(`RPC Response: ${JSON.stringify(result)}`);
 
   if (result.error) {
-    throw new Error(`RPC Error: ${result.error.message || JSON.stringify(result.error)}`);
+    addLog(`RPC Error: ${JSON.stringify(result.error)}`);
+    throw new Error(result.error.message || JSON.stringify(result.error));
   }
 
   return result.result as `0x${string}`;
@@ -249,10 +201,9 @@ export default function Home() {
   const ensureNetwork = async () => {
     const chainIdHex = await window.ethereum.request({ method: 'eth_chainId' });
     const currentChainId = parseInt(chainIdHex, 16);
-    addLog(`Current Chain ID: ${currentChainId}`);
 
     if (currentChainId !== CHAIN_ID) {
-      addLog(`Switching to Lens Testnet (${CHAIN_ID})...`);
+      addLog(`Switching to Lens Testnet...`);
       try {
         await window.ethereum.request({
           method: 'wallet_switchEthereumChain',
@@ -260,7 +211,6 @@ export default function Home() {
         });
       } catch (err: any) {
         if (err.code === 4902) {
-          addLog('Adding Lens Testnet...');
           await window.ethereum.request({
             method: 'wallet_addEthereumChain',
             params: [{
@@ -275,13 +225,13 @@ export default function Home() {
           throw err;
         }
       }
-      addLog('Network switched successfully');
     }
+    addLog(`Network: Lens Testnet (${CHAIN_ID})`);
   };
 
   const connect = async () => {
     if (!window.ethereum) {
-      alert('Please install MetaMask or another Web3 wallet');
+      alert('Please install MetaMask');
       return;
     }
     const [addr] = await window.ethereum.request({ method: 'eth_requestAccounts' });
@@ -296,7 +246,7 @@ export default function Home() {
 
     try {
       await ensureNetwork();
-      addLog('=== Starting Gasless Post ===');
+      addLog('=== Starting Gasless Transaction ===');
 
       const walletClient = createWalletClient({
         account: address,
@@ -309,12 +259,12 @@ export default function Home() {
         transport: http(),
       });
 
-      // Generate random data for stakePost
+      // Generate test data
       const targetId = randomBytes32();
       const groveHash = randomBytes32();
       const boardId = randomBytes32();
 
-      addLog(`Target ID: ${targetId.slice(0, 18)}...`);
+      addLog(`Target: ${targetId.slice(0, 18)}...`);
 
       const callData = encodeFunctionData({
         abi: StakeManagerABI,
@@ -322,9 +272,7 @@ export default function Home() {
         args: [targetId, groveHash, boardId, 0n],
       });
 
-      addLog(`Call data: ${callData.slice(0, 30)}...`);
-
-      const txHash = await sendZkSyncPaymasterTransaction(
+      const txHash = await sendGaslessTransaction(
         walletClient,
         publicClient,
         address,
@@ -336,12 +284,12 @@ export default function Home() {
       );
 
       addLog(`=== SUCCESS ===`);
-      addLog(`TX Hash: ${txHash}`);
-      addLog(`Explorer: https://block-explorer.testnet.lens.dev/tx/${txHash}`);
+      addLog(`TX: ${txHash}`);
+      addLog(`https://block-explorer.testnet.lens.dev/tx/${txHash}`);
 
     } catch (err: any) {
       addLog(`ERROR: ${err.message}`);
-      console.error('Full error:', err);
+      console.error(err);
     }
   };
 
@@ -374,16 +322,16 @@ export default function Home() {
               onClick={clearLogs}
               className="bg-gray-600 hover:bg-gray-700 text-white px-4 py-3 rounded-lg"
             >
-              Clear Logs
+              Clear
             </button>
           </div>
         </div>
       )}
 
       <div className="mt-8 bg-gray-900 text-green-400 p-4 rounded-lg min-h-[300px] overflow-auto text-sm">
-        <div className="text-gray-500 mb-2">// Transaction Log</div>
+        <div className="text-gray-500 mb-2">// Log</div>
         {logs.length === 0 ? (
-          <div className="text-gray-600">Waiting for action...</div>
+          <div className="text-gray-600">Ready...</div>
         ) : (
           logs.map((log, i) => <div key={i} className="py-0.5">{log}</div>)
         )}
